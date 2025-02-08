@@ -1,0 +1,140 @@
+import numpy as np
+import pandas as pd
+from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpBinary, LpStatus, value
+
+# ---------------------------
+# 1. Simulate Synthetic Data
+# ---------------------------
+np.random.seed(42)
+n_treated = 30
+n_controls = 50
+
+# Generate treated patients:
+# - treatment_time: random in [0,50]
+# - covariates: pain, urgency, frequency as integers 1–5
+treated_data = pd.DataFrame({
+    'id': np.arange(n_treated),
+    'treated': 1,
+    'treatment_time': np.random.uniform(0, 50, n_treated),
+    'pain': np.random.randint(1, 6, n_treated),
+    'urgency': np.random.randint(1, 6, n_treated),
+    'frequency': np.random.randint(1, 6, n_treated)
+})
+
+# Generate control patients:
+# - treatment_time: fixed at 100 (i.e. after every treated patient)
+# - covariates sampled similarly
+control_data = pd.DataFrame({
+    'id': np.arange(n_treated, n_treated + n_controls),
+    'treated': 0,
+    'treatment_time': 100,  # controls have not yet received treatment at any treated time
+    'pain': np.random.randint(1, 6, n_controls),
+    'urgency': np.random.randint(1, 6, n_controls),
+    'frequency': np.random.randint(1, 6, n_controls)
+})
+
+# For easy lookup later, create dictionaries keyed by patient id.
+treated_dict = treated_data.set_index('id').to_dict('index')
+control_dict = control_data.set_index('id').to_dict('index')
+
+# -----------------------------------
+# 2. Define Risk Sets (Eligible Pairs)
+# -----------------------------------
+# For each treated patient i, eligible controls j are those with j.treatment_time > i.treatment_time.
+eligible_pairs = []
+for idx, row in treated_data.iterrows():
+    for idx_c, row_c in control_data.iterrows():
+        if row_c['treatment_time'] > row['treatment_time']:
+            eligible_pairs.append((row['id'], row_c['id']))
+# (In this simulation all controls are eligible for every treated patient.)
+
+# ---------------------------------------------------
+# 3. Compute Mahalanobis Distances Between Pairs
+# ---------------------------------------------------
+covariates = ['pain', 'urgency', 'frequency']
+
+# To compute the Mahalanobis distance we first compute the (pseudo-)inverse of the covariance matrix.
+combined = pd.concat([treated_data, control_data])
+cov_matrix = np.cov(combined[covariates].values.T)
+inv_cov_matrix = np.linalg.pinv(cov_matrix)
+
+def mahalanobis(x, y, inv_cov):
+    diff = x - y
+    return np.sqrt(np.dot(np.dot(diff, inv_cov), diff))
+
+# Compute and store distances for each eligible (treated, control) pair.
+distances = {}
+for (i, j) in eligible_pairs:
+    x_vec = np.array([treated_dict[i][v] for v in covariates])
+    y_vec = np.array([control_dict[j][v] for v in covariates])
+    distances[(i, j)] = mahalanobis(x_vec, y_vec, inv_cov_matrix)
+
+# ---------------------------------------------------
+# 4. Set Up the Integer Programming Matching Model
+# ---------------------------------------------------
+model = LpProblem("BalancedRiskSetMatching", LpMinimize)
+
+# Decision variables: x[i,j] = 1 if treated i is matched with control j.
+x_vars = {(i, j): LpVariable(f"x_{i}_{j}", cat=LpBinary) for (i, j) in eligible_pairs}
+
+# --- Fine Balance via Soft Constraints ---
+# For each covariate v and for each level l in {1,2,3,4,5}, we create a slack variable delta[v,l]
+# to capture any imbalance between the marginal distribution of the matched controls and the treated group.
+levels = [1, 2, 3, 4, 5]
+penalty_weight = 1000  # high weight to force balance when possible
+delta_vars = {}
+for v in covariates:
+    for l in levels:
+        delta_vars[(v, l)] = LpVariable(f"delta_{v}_{l}", lowBound=0)
+
+# --- Assignment Constraints ---
+# Each treated patient must be matched to exactly one control.
+for i in treated_data['id']:
+    eligible_js = [j for (i2, j) in eligible_pairs if i2 == i]
+    model += lpSum(x_vars[(i, j)] for j in eligible_js) == 1, f"assign_treated_{i}"
+
+# Each control may be matched at most once.
+for j in control_data['id']:
+    eligible_is = [i for (i, j2) in eligible_pairs if j2 == j]
+    model += lpSum(x_vars[(i, j)] for i in eligible_is) <= 1, f"assign_control_{j}"
+
+# --- Fine Balance (Soft) Constraints ---
+# For each covariate v and level l, let T_count be the number of treated patients having v == l.
+# We require that the total number of matched controls with v == l is as close as possible to T_count.
+for v in covariates:
+    for l in levels:
+        T_count = sum(1 for i in treated_data['id'] if treated_dict[i][v] == l)
+        # Sum over all matches where the control’s v value equals l.
+        control_match_sum = lpSum(x_vars[(i, j)] for (i, j) in eligible_pairs if control_dict[j][v] == l)
+        # Two constraints to capture absolute deviation:
+        model += (control_match_sum - T_count <= delta_vars[(v, l)]), f"balance_pos_{v}_{l}"
+        model += (T_count - control_match_sum <= delta_vars[(v, l)]), f"balance_neg_{v}_{l}"
+
+# --- Objective Function ---
+# The goal is to minimize the total Mahalanobis distance of the matches plus a large penalty for any imbalance.
+model += (
+    lpSum(distances[(i, j)] * x_vars[(i, j)] for (i, j) in eligible_pairs)
+    + penalty_weight * lpSum(delta_vars[(v, l)] for v in covariates for l in levels)
+)
+
+# ---------------------------
+# 5. Solve the Model
+# ---------------------------
+model.solve()
+
+print("Solver Status:", LpStatus[model.status])
+print("Objective Value:", value(model.objective))
+
+# Extract and display the matches.
+matches = []
+print("\nMatched Pairs (Treated, Control):")
+for (i, j), var in x_vars.items():
+    if var.varValue is not None and var.varValue > 0.5:
+        matches.append((i, j))
+        print(f"  Treated {i} matched with Control {j}  (Distance = {distances[(i, j)]:.2f})")
+
+# Optionally, one could display the achieved imbalances for each covariate level.
+print("\nImbalance (delta) by Covariate and Level:")
+for v in covariates:
+    for l in levels:
+        print(f"  {v} level {l}: {delta_vars[(v, l)].varValue:.2f}")
