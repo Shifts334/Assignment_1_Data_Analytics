@@ -1,0 +1,367 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Balanced Risk Set Matching using Integer Programming\n",
+    "\n",
+    "This notebook demonstrates how to implement balanced risk set matching using Python. It utilizes the required libraries such as NumPy, Pandas, SciPy, Matplotlib, Seaborn, Tabulate, and PuLP. \n",
+    "\n",
+    "Make sure to install the required packages before running the notebook:\n",
+    "```\n",
+    "!pip install numpy pandas scipy matplotlib seaborn tabulate pulp\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Required Packages (install these before running the notebook)\n",
+    "# !pip install numpy pandas scipy matplotlib seaborn tabulate pulp\n",
+    "\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "import seaborn as sns\n",
+    "import scipy.linalg\n",
+    "from scipy.spatial.distance import cdist\n",
+    "from scipy.stats import wilcoxon\n",
+    "from tabulate import tabulate\n",
+    "\n",
+    "from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpBinary, LpStatus, value"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 0. Define and Test the Mahalanobis Distance Function"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "def mahalanobis(x, y, inv_cov):\n",
+    "    \"\"\"\n",
+    "    Compute the Mahalanobis distance between vectors x and y, given the inverse covariance matrix.\n",
+    "    Includes a safeguard to prevent negative values due to numerical precision issues.\n",
+    "    \"\"\"\n",
+    "    diff = x - y\n",
+    "    dist_sq = np.dot(np.dot(diff, inv_cov), diff)\n",
+    "    return np.sqrt(max(dist_sq, 0.0))\n",
+    "\n",
+    "def test_mahalanobis():\n",
+    "    \"\"\"\n",
+    "    Test cases to ensure the mahalanobis function produces correct outputs.\n",
+    "    \"\"\"\n",
+    "    # Test 1: Identical vectors → distance should be 0.\n",
+    "    x = np.array([1.0, 2.0, 3.0])\n",
+    "    y = np.array([1.0, 2.0, 3.0])\n",
+    "    inv_cov_identity = np.eye(3)\n",
+    "    dist = mahalanobis(x, y, inv_cov_identity)\n",
+    "    assert np.isclose(dist, 0.0), f\"Test 1 Failed: Expected 0, got {dist}\"\n",
+    "\n",
+    "    # Test 2: Using identity inverse covariance, the Mahalanobis distance equals the Euclidean distance.\n",
+    "    x = np.array([0.0, 0.0, 0.0])\n",
+    "    y = np.array([1.0, 1.0, 1.0])\n",
+    "    expected = np.sqrt(3)\n",
+    "    dist = mahalanobis(x, y, inv_cov_identity)\n",
+    "    assert np.isclose(dist, expected), f\"Test 2 Failed: Expected {expected}, got {dist}\"\n",
+    "    \n",
+    "    # Test 3: Non-trivial covariance matrix.\n",
+    "    cov = np.array([[2.0, 0.5, 0.3],\n",
+    "                    [0.5, 1.0, 0.2],\n",
+    "                    [0.3, 0.2, 1.5]])\n",
+    "    inv_cov = np.linalg.pinv(cov)\n",
+    "    x = np.array([2.0, 3.0, 4.0])\n",
+    "    y = np.array([1.0, 2.0, 3.0])\n",
+    "    expected = np.sqrt((x - y).T @ inv_cov @ (x - y))\n",
+    "    dist = mahalanobis(x, y, inv_cov)\n",
+    "    assert np.isclose(dist, expected), f\"Test 3 Failed: Expected {expected}, got {dist}\"\n",
+    "    \n",
+    "    print(\"All Mahalanobis distance tests passed.\")\n",
+    "\n",
+    "# Run tests\n",
+    "test_mahalanobis()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Simulate Synthetic Data & Outcomes"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "np.random.seed(42)\n",
+    "n_treated = 30\n",
+    "n_controls = 50\n",
+    "\n",
+    "# Create treated patient data.\n",
+    "treated_data = pd.DataFrame({\n",
+    "    'id': np.arange(n_treated),\n",
+    "    'treated': 1,\n",
+    "    'treatment_time': np.random.uniform(0, 50, n_treated),\n",
+    "    'pain': np.random.randint(1, 6, n_treated),\n",
+    "    'urgency': np.random.randint(1, 6, n_treated),\n",
+    "    'frequency': np.random.randint(1, 6, n_treated)\n",
+    "})\n",
+    "\n",
+    "# Create control patient data.\n",
+    "control_data = pd.DataFrame({\n",
+    "    'id': np.arange(n_treated, n_treated + n_controls),\n",
+    "    'treated': 0,\n",
+    "    'treatment_time': 100,  # All controls have treatment_time later than any treated.\n",
+    "    'pain': np.random.randint(1, 6, n_controls),\n",
+    "    'urgency': np.random.randint(1, 6, n_controls),\n",
+    "    'frequency': np.random.randint(1, 6, n_controls)\n",
+    "})\n",
+    "\n",
+    "# Simulate an outcome variable.\n",
+    "# Base outcome is a weighted sum of covariates plus noise.\n",
+    "# Treated patients receive an additional treatment effect of +1.\n",
+    "treated_data['outcome'] = (treated_data['pain'] * 0.5 +\n",
+    "                           treated_data['urgency'] * 0.3 +\n",
+    "                           treated_data['frequency'] * 0.2 +\n",
+    "                           np.random.normal(0, 1, n_treated) + 1.0)\n",
+    "control_data['outcome'] = (control_data['pain'] * 0.5 +\n",
+    "                           control_data['urgency'] * 0.3 +\n",
+    "                           control_data['frequency'] * 0.2 +\n",
+    "                           np.random.normal(0, 1, n_controls))\n",
+    "\n",
+    "# For quick lookups, create dictionaries indexed by patient id.\n",
+    "treated_dict = treated_data.set_index('id').to_dict('index')\n",
+    "control_dict = control_data.set_index('id').to_dict('index')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Define Risk Sets (Eligible Pairs)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# For each treated patient i, eligible controls j have j.treatment_time > i.treatment_time.\n",
+    "eligible_pairs = []\n",
+    "for idx, row in treated_data.iterrows():\n",
+    "    for idx_c, row_c in control_data.iterrows():\n",
+    "        if row_c['treatment_time'] > row['treatment_time']:\n",
+    "            eligible_pairs.append((row['id'], row_c['id']))\n",
+    "# In our simulation, all controls are eligible for every treated patient."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Compute Mahalanobis Distances Between Eligible Pairs"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "covariates = ['pain', 'urgency', 'frequency']\n",
+    "\n",
+    "# Compute the covariance matrix using both treated and control data.\n",
+    "combined = pd.concat([treated_data, control_data])\n",
+    "cov_matrix = np.cov(combined[covariates].values.T)\n",
+    "\n",
+    "# Use scipy.linalg.pinv to compute the pseudo-inverse.\n",
+    "inv_cov_matrix = scipy.linalg.pinv(cov_matrix)\n",
+    "\n",
+    "# Compute and store the Mahalanobis distance for each eligible pair.\n",
+    "distances = {}\n",
+    "for (i, j) in eligible_pairs:\n",
+    "    x_vec = np.array([treated_dict[i][v] for v in covariates])\n",
+    "    y_vec = np.array([control_dict[j][v] for v in covariates])\n",
+    "    distances[(i, j)] = mahalanobis(x_vec, y_vec, inv_cov_matrix)\n",
+    "\n",
+    "# --- Demonstrate usage of cdist ---\n",
+    "# Compute the full distance matrix between treated and control patients.\n",
+    "treated_cov = treated_data[covariates].values\n",
+    "control_cov = control_data[covariates].values\n",
+    "distance_matrix = cdist(treated_cov, control_cov, metric='mahalanobis', VI=inv_cov_matrix)\n",
+    "print(\"\\nDistance matrix computed using cdist:\")\n",
+    "print(distance_matrix)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Set Up the Integer Programming Matching Model via PuLP"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "model = LpProblem(\"BalancedRiskSetMatching\", LpMinimize)\n",
+    "\n",
+    "# Decision variables: x[i,j] = 1 if treated i is matched with control j.\n",
+    "x_vars = {(i, j): LpVariable(f\"x_{i}_{j}\", cat=LpBinary) for (i, j) in eligible_pairs}\n",
+    "\n",
+    "# Fine balance soft constraints:\n",
+    "# For each covariate v and each level in {1,2,3,4,5}, define a slack variable to capture imbalance.\n",
+    "levels = [1, 2, 3, 4, 5]\n",
+    "penalty_weight = 1000  # High weight to force close balance.\n",
+    "delta_vars = {}\n",
+    "for v in covariates:\n",
+    "    for l in levels:\n",
+    "        delta_vars[(v, l)] = LpVariable(f\"delta_{v}_{l}\", lowBound=0)\n",
+    "\n",
+    "# --- Assignment Constraints ---\n",
+    "# Each treated patient must be matched to exactly one control.\n",
+    "for i in treated_data['id']:\n",
+    "    eligible_js = [j for (i2, j) in eligible_pairs if i2 == i]\n",
+    "    model += lpSum(x_vars[(i, j)] for j in eligible_js) == 1, f\"assign_treated_{i}\"\n",
+    "\n",
+    "# Each control can be matched at most once.\n",
+    "for j in control_data['id']:\n",
+    "    eligible_is = [i for (i, j2) in eligible_pairs if j2 == j]\n",
+    "    model += lpSum(x_vars[(i, j)] for i in eligible_is) <= 1, f\"assign_control_{j}\"\n",
+    "\n",
+    "# --- Fine Balance (Soft) Constraints ---\n",
+    "# For each covariate v and level l, force the matched control distribution to approximate that of the treated group.\n",
+    "for v in covariates:\n",
+    "    for l in levels:\n",
+    "        T_count = sum(1 for i in treated_data['id'] if treated_dict[i][v] == l)\n",
+    "        control_match_sum = lpSum(x_vars[(i, j)] for (i, j) in eligible_pairs if control_dict[j][v] == l)\n",
+    "        model += (control_match_sum - T_count <= delta_vars[(v, l)]), f\"balance_pos_{v}_{l}\"\n",
+    "        model += (T_count - control_match_sum <= delta_vars[(v, l)]), f\"balance_neg_{v}_{l}\"\n",
+    "\n",
+    "# --- Objective Function ---\n",
+    "# Minimize the total Mahalanobis distance of the matches plus a heavy penalty for any imbalance.\n",
+    "model += (\n",
+    "    lpSum(distances[(i, j)] * x_vars[(i, j)] for (i, j) in eligible_pairs)\n",
+    "    + penalty_weight * lpSum(delta_vars[(v, l)] for v in covariates for l in levels)\n",
+    ")\n",
+    "\n",
+    "# Solve the model.\n",
+    "model.solve()\n",
+    "print(\"\\nSolver Status:\", LpStatus[model.status])\n",
+    "print(\"Objective Value:\", value(model.objective))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Extract Matches, Evaluate Outcomes, and Perform Statistical Testing"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Extract matched pairs and display them using tabulate.\n",
+    "matches = []\n",
+    "for (i, j), var in x_vars.items():\n",
+    "    if var.varValue is not None and var.varValue > 0.5:\n",
+    "        matches.append((i, j, distances[(i, j)]))\n",
+    "match_table = tabulate(matches, headers=[\"Treated ID\", \"Control ID\", \"Distance\"], tablefmt=\"psql\")\n",
+    "print(\"\\nMatched Pairs:\")\n",
+    "print(match_table)\n",
+    "\n",
+    "# Display imbalance (slack variable) values.\n",
+    "imbalance_list = []\n",
+    "for v in covariates:\n",
+    "    for l in levels:\n",
+    "        imbalance_list.append([v, l, delta_vars[(v, l)].varValue])\n",
+    "imbalance_table = tabulate(imbalance_list, headers=[\"Covariate\", \"Level\", \"Imbalance\"], tablefmt=\"psql\")\n",
+    "print(\"\\nImbalance (Slack Variables):\")\n",
+    "print(imbalance_table)\n",
+    "\n",
+    "# Create a DataFrame with outcomes for each matched pair.\n",
+    "matched_pairs_outcomes = []\n",
+    "for (i, j, dist_val) in matches:\n",
+    "    treated_outcome = treated_dict[i]['outcome']\n",
+    "    control_outcome = control_dict[j]['outcome']\n",
+    "    diff = treated_outcome - control_outcome\n",
+    "    matched_pairs_outcomes.append((i, j, treated_outcome, control_outcome, diff))\n",
+    "df_matches = pd.DataFrame(matched_pairs_outcomes,\n",
+    "                          columns=['Treated ID', 'Control ID', 'Treated Outcome', 'Control Outcome', 'Difference'])\n",
+    "print(\"\\nMatched Pairs Outcomes:\")\n",
+    "print(tabulate(df_matches, headers='keys', tablefmt='psql', showindex=False))\n",
+    "\n",
+    "# Perform a Wilcoxon signed-rank test on the outcome differences.\n",
+    "if len(df_matches) > 0:\n",
+    "    stat, p_value = wilcoxon(df_matches['Difference'])\n",
+    "    print(f\"\\nWilcoxon signed-rank test: statistic = {stat:.3f}, p-value = {p_value:.3f}\")\n",
+    "else:\n",
+    "    print(\"\\nNot enough matches for the Wilcoxon test.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Visualization Using Matplotlib and Seaborn"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "source": [
+    "# Plot a histogram of the Mahalanobis distances for all eligible pairs.\n",
+    "all_distances = list(distances.values())\n",
+    "sns.histplot(all_distances, bins=20, kde=True)\n",
+    "plt.title(\"Histogram of Mahalanobis Distances (Eligible Pairs)\")\n",
+    "plt.xlabel(\"Mahalanobis Distance\")\n",
+    "plt.ylabel(\"Frequency\")\n",
+    "plt.show()\n",
+    "\n",
+    "# Plot a histogram of outcome differences in the matched pairs.\n",
+    "sns.histplot(df_matches['Difference'], bins=10, kde=True)\n",
+    "plt.title(\"Distribution of Outcome Differences in Matched Pairs\")\n",
+    "plt.xlabel(\"Treated Outcome - Control Outcome\")\n",
+    "plt.ylabel(\"Count\")\n",
+    "plt.show()\n",
+    "\n",
+    "# Plot a heatmap of the imbalance (slack variables) for each covariate and level.\n",
+    "imbalance_data = []\n",
+    "for v in covariates:\n",
+    "    row = []\n",
+    "    for l in levels:\n",
+    "        row.append(delta_vars[(v, l)].varValue)\n",
+    "    imbalance_data.append(row)\n",
+    "imbalance_df = pd.DataFrame(imbalance_data, index=covariates, columns=[f\"Level {l}\" for l in levels])\n",
+    "sns.heatmap(imbalance_df, annot=True, cmap=\"viridis\")\n",
+    "plt.title(\"Imbalance (Slack Variables) for Covariates by Level\")\n",
+    "plt.show()"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.x"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

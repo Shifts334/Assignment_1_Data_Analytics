@@ -1,17 +1,73 @@
+# Required Packages (install these before running the script)
+# !pip install numpy pandas scipy matplotlib seaborn tabulate pulp
+
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.linalg
+from scipy.spatial.distance import cdist
+from scipy.stats import wilcoxon
+from tabulate import tabulate
+
 from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpBinary, LpStatus, value
 
-# ---------------------------
-# 1. Simulate Synthetic Data
-# ---------------------------
+# =============================================================================
+# 0. Define and Test the Mahalanobis Distance Function
+# =============================================================================
+
+def mahalanobis(x, y, inv_cov):
+    """
+    Compute the Mahalanobis distance between vectors x and y, given the inverse covariance matrix.
+    Includes a safeguard to prevent negative values due to numerical precision issues.
+    """
+    diff = x - y
+    dist_sq = np.dot(np.dot(diff, inv_cov), diff)
+    return np.sqrt(max(dist_sq, 0.0))
+
+def test_mahalanobis():
+    """
+    Test cases to ensure the mahalanobis function produces correct outputs.
+    """
+    # Test 1: Identical vectors → distance should be 0.
+    x = np.array([1.0, 2.0, 3.0])
+    y = np.array([1.0, 2.0, 3.0])
+    inv_cov_identity = np.eye(3)
+    dist = mahalanobis(x, y, inv_cov_identity)
+    assert np.isclose(dist, 0.0), f"Test 1 Failed: Expected 0, got {dist}"
+
+    # Test 2: Using identity inverse covariance, the Mahalanobis distance equals the Euclidean distance.
+    x = np.array([0.0, 0.0, 0.0])
+    y = np.array([1.0, 1.0, 1.0])
+    expected = np.sqrt(3)
+    dist = mahalanobis(x, y, inv_cov_identity)
+    assert np.isclose(dist, expected), f"Test 2 Failed: Expected {expected}, got {dist}"
+    
+    # Test 3: Non-trivial covariance matrix.
+    cov = np.array([[2.0, 0.5, 0.3],
+                    [0.5, 1.0, 0.2],
+                    [0.3, 0.2, 1.5]])
+    inv_cov = np.linalg.pinv(cov)
+    x = np.array([2.0, 3.0, 4.0])
+    y = np.array([1.0, 2.0, 3.0])
+    expected = np.sqrt((x - y).T @ inv_cov @ (x - y))
+    dist = mahalanobis(x, y, inv_cov)
+    assert np.isclose(dist, expected), f"Test 3 Failed: Expected {expected}, got {dist}"
+    
+    print("All Mahalanobis distance tests passed.")
+
+# Run tests
+test_mahalanobis()
+
+# =============================================================================
+# 1. Simulate Synthetic Data & Outcomes
+# =============================================================================
+
 np.random.seed(42)
 n_treated = 30
 n_controls = 50
 
-# Generate treated patients:
-# - treatment_time: random in [0,50]
-# - covariates: pain, urgency, frequency as integers 1–5
+# Create treated patient data.
 treated_data = pd.DataFrame({
     'id': np.arange(n_treated),
     'treated': 1,
@@ -21,67 +77,85 @@ treated_data = pd.DataFrame({
     'frequency': np.random.randint(1, 6, n_treated)
 })
 
-# Generate control patients:
-# - treatment_time: fixed at 100 (i.e. after every treated patient)
-# - covariates sampled similarly
+# Create control patient data.
 control_data = pd.DataFrame({
     'id': np.arange(n_treated, n_treated + n_controls),
     'treated': 0,
-    'treatment_time': 100,  # controls have not yet received treatment at any treated time
+    'treatment_time': 100,  # All controls have treatment_time later than any treated.
     'pain': np.random.randint(1, 6, n_controls),
     'urgency': np.random.randint(1, 6, n_controls),
     'frequency': np.random.randint(1, 6, n_controls)
 })
 
-# For easy lookup later, create dictionaries keyed by patient id.
+# Simulate an outcome variable.
+# Base outcome is a weighted sum of covariates plus noise.
+# Treated patients receive an additional treatment effect of +1.
+treated_data['outcome'] = (treated_data['pain'] * 0.5 +
+                           treated_data['urgency'] * 0.3 +
+                           treated_data['frequency'] * 0.2 +
+                           np.random.normal(0, 1, n_treated) + 1.0)
+control_data['outcome'] = (control_data['pain'] * 0.5 +
+                           control_data['urgency'] * 0.3 +
+                           control_data['frequency'] * 0.2 +
+                           np.random.normal(0, 1, n_controls))
+
+# For quick lookups, create dictionaries indexed by patient id.
 treated_dict = treated_data.set_index('id').to_dict('index')
 control_dict = control_data.set_index('id').to_dict('index')
 
-# -----------------------------------
+# =============================================================================
 # 2. Define Risk Sets (Eligible Pairs)
-# -----------------------------------
-# For each treated patient i, eligible controls j are those with j.treatment_time > i.treatment_time.
+# =============================================================================
+
+# For each treated patient i, eligible controls j have j.treatment_time > i.treatment_time.
 eligible_pairs = []
 for idx, row in treated_data.iterrows():
     for idx_c, row_c in control_data.iterrows():
         if row_c['treatment_time'] > row['treatment_time']:
             eligible_pairs.append((row['id'], row_c['id']))
-# (In this simulation all controls are eligible for every treated patient.)
+# In our simulation, all controls are eligible for every treated patient.
 
-# ---------------------------------------------------
-# 3. Compute Mahalanobis Distances Between Pairs
-# ---------------------------------------------------
+# =============================================================================
+# 3. Compute Mahalanobis Distances Between Eligible Pairs
+# =============================================================================
+
 covariates = ['pain', 'urgency', 'frequency']
 
-# To compute the Mahalanobis distance we first compute the (pseudo-)inverse of the covariance matrix.
+# Compute the covariance matrix using both treated and control data.
 combined = pd.concat([treated_data, control_data])
 cov_matrix = np.cov(combined[covariates].values.T)
-inv_cov_matrix = np.linalg.pinv(cov_matrix)
 
-def mahalanobis(x, y, inv_cov):
-    diff = x - y
-    return np.sqrt(np.dot(np.dot(diff, inv_cov), diff))
+# Use scipy.linalg.pinv to compute the pseudo-inverse.
+inv_cov_matrix = scipy.linalg.pinv(cov_matrix)
 
-# Compute and store distances for each eligible (treated, control) pair.
+# Compute and store the Mahalanobis distance for each eligible pair.
 distances = {}
 for (i, j) in eligible_pairs:
     x_vec = np.array([treated_dict[i][v] for v in covariates])
     y_vec = np.array([control_dict[j][v] for v in covariates])
     distances[(i, j)] = mahalanobis(x_vec, y_vec, inv_cov_matrix)
 
-# ---------------------------------------------------
-# 4. Set Up the Integer Programming Matching Model
-# ---------------------------------------------------
+# --- Demonstrate usage of cdist ---
+# Compute the full distance matrix between treated and control patients.
+treated_cov = treated_data[covariates].values
+control_cov = control_data[covariates].values
+distance_matrix = cdist(treated_cov, control_cov, metric='mahalanobis', VI=inv_cov_matrix)
+print("\nDistance matrix computed using cdist:")
+print(distance_matrix)
+
+# =============================================================================
+# 4. Set Up the Integer Programming Matching Model via PuLP
+# =============================================================================
+
 model = LpProblem("BalancedRiskSetMatching", LpMinimize)
 
 # Decision variables: x[i,j] = 1 if treated i is matched with control j.
 x_vars = {(i, j): LpVariable(f"x_{i}_{j}", cat=LpBinary) for (i, j) in eligible_pairs}
 
-# --- Fine Balance via Soft Constraints ---
-# For each covariate v and for each level l in {1,2,3,4,5}, we create a slack variable delta[v,l]
-# to capture any imbalance between the marginal distribution of the matched controls and the treated group.
+# Fine balance soft constraints:
+# For each covariate v and each level in {1,2,3,4,5}, define a slack variable to capture imbalance.
 levels = [1, 2, 3, 4, 5]
-penalty_weight = 1000  # high weight to force balance when possible
+penalty_weight = 1000  # High weight to force close balance.
 delta_vars = {}
 for v in covariates:
     for l in levels:
@@ -93,48 +167,100 @@ for i in treated_data['id']:
     eligible_js = [j for (i2, j) in eligible_pairs if i2 == i]
     model += lpSum(x_vars[(i, j)] for j in eligible_js) == 1, f"assign_treated_{i}"
 
-# Each control may be matched at most once.
+# Each control can be matched at most once.
 for j in control_data['id']:
     eligible_is = [i for (i, j2) in eligible_pairs if j2 == j]
     model += lpSum(x_vars[(i, j)] for i in eligible_is) <= 1, f"assign_control_{j}"
 
 # --- Fine Balance (Soft) Constraints ---
-# For each covariate v and level l, let T_count be the number of treated patients having v == l.
-# We require that the total number of matched controls with v == l is as close as possible to T_count.
+# For each covariate v and level l, force the matched control distribution to approximate that of the treated group.
 for v in covariates:
     for l in levels:
         T_count = sum(1 for i in treated_data['id'] if treated_dict[i][v] == l)
-        # Sum over all matches where the control’s v value equals l.
         control_match_sum = lpSum(x_vars[(i, j)] for (i, j) in eligible_pairs if control_dict[j][v] == l)
-        # Two constraints to capture absolute deviation:
         model += (control_match_sum - T_count <= delta_vars[(v, l)]), f"balance_pos_{v}_{l}"
         model += (T_count - control_match_sum <= delta_vars[(v, l)]), f"balance_neg_{v}_{l}"
 
 # --- Objective Function ---
-# The goal is to minimize the total Mahalanobis distance of the matches plus a large penalty for any imbalance.
+# Minimize the total Mahalanobis distance of the matches plus a heavy penalty for any imbalance.
 model += (
     lpSum(distances[(i, j)] * x_vars[(i, j)] for (i, j) in eligible_pairs)
     + penalty_weight * lpSum(delta_vars[(v, l)] for v in covariates for l in levels)
 )
 
-# ---------------------------
-# 5. Solve the Model
-# ---------------------------
+# Solve the model.
 model.solve()
-
-print("Solver Status:", LpStatus[model.status])
+print("\nSolver Status:", LpStatus[model.status])
 print("Objective Value:", value(model.objective))
 
-# Extract and display the matches.
+# =============================================================================
+# 5. Extract Matches, Evaluate Outcomes, and Perform Statistical Testing
+# =============================================================================
+
+# Extract matched pairs and display them using tabulate.
 matches = []
-print("\nMatched Pairs (Treated, Control):")
 for (i, j), var in x_vars.items():
     if var.varValue is not None and var.varValue > 0.5:
-        matches.append((i, j))
-        print(f"  Treated {i} matched with Control {j}  (Distance = {distances[(i, j)]:.2f})")
+        matches.append((i, j, distances[(i, j)]))
+match_table = tabulate(matches, headers=["Treated ID", "Control ID", "Distance"], tablefmt="psql")
+print("\nMatched Pairs:")
+print(match_table)
 
-# Optionally, one could display the achieved imbalances for each covariate level.
-print("\nImbalance (delta) by Covariate and Level:")
+# Display imbalance (slack variable) values.
+imbalance_list = []
 for v in covariates:
     for l in levels:
-        print(f"  {v} level {l}: {delta_vars[(v, l)].varValue:.2f}")
+        imbalance_list.append([v, l, delta_vars[(v, l)].varValue])
+imbalance_table = tabulate(imbalance_list, headers=["Covariate", "Level", "Imbalance"], tablefmt="psql")
+print("\nImbalance (Slack Variables):")
+print(imbalance_table)
+
+# Create a DataFrame with outcomes for each matched pair.
+matched_pairs_outcomes = []
+for (i, j, dist_val) in matches:
+    treated_outcome = treated_dict[i]['outcome']
+    control_outcome = control_dict[j]['outcome']
+    diff = treated_outcome - control_outcome
+    matched_pairs_outcomes.append((i, j, treated_outcome, control_outcome, diff))
+df_matches = pd.DataFrame(matched_pairs_outcomes,
+                          columns=['Treated ID', 'Control ID', 'Treated Outcome', 'Control Outcome', 'Difference'])
+print("\nMatched Pairs Outcomes:")
+print(tabulate(df_matches, headers='keys', tablefmt='psql', showindex=False))
+
+# Perform a Wilcoxon signed-rank test on the outcome differences.
+if len(df_matches) > 0:
+    stat, p_value = wilcoxon(df_matches['Difference'])
+    print(f"\nWilcoxon signed-rank test: statistic = {stat:.3f}, p-value = {p_value:.3f}")
+else:
+    print("\nNot enough matches for the Wilcoxon test.")
+
+# =============================================================================
+# 6. Visualization Using Matplotlib and Seaborn
+# =============================================================================
+
+# Plot a histogram of the Mahalanobis distances for all eligible pairs.
+all_distances = list(distances.values())
+sns.histplot(all_distances, bins=20, kde=True)
+plt.title("Histogram of Mahalanobis Distances (Eligible Pairs)")
+plt.xlabel("Mahalanobis Distance")
+plt.ylabel("Frequency")
+plt.show()
+
+# Plot a histogram of outcome differences in the matched pairs.
+sns.histplot(df_matches['Difference'], bins=10, kde=True)
+plt.title("Distribution of Outcome Differences in Matched Pairs")
+plt.xlabel("Treated Outcome - Control Outcome")
+plt.ylabel("Count")
+plt.show()
+
+# Plot a heatmap of the imbalance (slack variables) for each covariate and level.
+imbalance_data = []
+for v in covariates:
+    row = []
+    for l in levels:
+        row.append(delta_vars[(v, l)].varValue)
+    imbalance_data.append(row)
+imbalance_df = pd.DataFrame(imbalance_data, index=covariates, columns=[f"Level {l}" for l in levels])
+sns.heatmap(imbalance_df, annot=True, cmap="viridis")
+plt.title("Imbalance (Slack Variables) for Covariates by Level")
+plt.show()
