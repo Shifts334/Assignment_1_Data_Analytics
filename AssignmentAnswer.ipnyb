@@ -6,9 +6,11 @@
    "source": [
     "# Balanced Risk Set Matching using Integer Programming\n",
     "\n",
-    "This notebook demonstrates how to implement balanced risk set matching using Python. It utilizes the required libraries such as NumPy, Pandas, SciPy, Matplotlib, Seaborn, Tabulate, and PuLP. \n",
+    "This notebook demonstrates how to implement balanced risk set matching using Python. It utilizes the required libraries such as NumPy, Pandas, SciPy, Matplotlib, Seaborn, Tabulate, and PuLP.\n",
     "\n",
-    "Make sure to install the required packages before running the notebook:\n",
+    "**Note:** This notebook is fully compatible with GitHub’s notebook preview feature. Simply open this file in GitHub to see the rendered version, or use [nbviewer](https://nbviewer.jupyter.org/) for an enhanced preview.\n",
+    "\n",
+    "Before running the notebook locally, make sure to install the required packages:\n",
     "```\n",
     "!pip install numpy pandas scipy matplotlib seaborn tabulate pulp\n",
     "```"
@@ -129,18 +131,18 @@
     "# Simulate an outcome variable.\n",
     "# Base outcome is a weighted sum of covariates plus noise.\n",
     "# Treated patients receive an additional treatment effect of +1.\n",
-    "treated_data['outcome'] = (treated_data['pain'] * 0.5 +\n",
-    "                           treated_data['urgency'] * 0.3 +\n",
-    "                           treated_data['frequency'] * 0.2 +\n",
+    "treated_data[\"outcome\"] = (treated_data[\"pain\"] * 0.5 +\n",
+    "                           treated_data[\"urgency\"] * 0.3 +\n",
+    "                           treated_data[\"frequency\"] * 0.2 +\n",
     "                           np.random.normal(0, 1, n_treated) + 1.0)\n",
-    "control_data['outcome'] = (control_data['pain'] * 0.5 +\n",
-    "                           control_data['urgency'] * 0.3 +\n",
-    "                           control_data['frequency'] * 0.2 +\n",
+    "control_data[\"outcome\"] = (control_data[\"pain\"] * 0.5 +\n",
+    "                           control_data[\"urgency\"] * 0.3 +\n",
+    "                           control_data[\"frequency\"] * 0.2 +\n",
     "                           np.random.normal(0, 1, n_controls))\n",
     "\n",
     "# For quick lookups, create dictionaries indexed by patient id.\n",
-    "treated_dict = treated_data.set_index('id').to_dict('index')\n",
-    "control_dict = control_data.set_index('id').to_dict('index')"
+    "treated_dict = treated_data.set_index(\"id\").to_dict(\"index\")\n",
+    "control_dict = control_data.set_index(\"id\").to_dict(\"index\")"
    ]
   },
   {
@@ -159,8 +161,8 @@
     "eligible_pairs = []\n",
     "for idx, row in treated_data.iterrows():\n",
     "    for idx_c, row_c in control_data.iterrows():\n",
-    "        if row_c['treatment_time'] > row['treatment_time']:\n",
-    "            eligible_pairs.append((row['id'], row_c['id']))\n",
+    "        if row_c[\"treatment_time\"] > row[\"treatment_time\"]:\n",
+    "            eligible_pairs.append((row[\"id\"], row_c[\"id\"]))\n",
     "# In our simulation, all controls are eligible for every treated patient."
    ]
   },
@@ -176,7 +178,7 @@
    "execution_count": null,
    "metadata": {},
    "source": [
-    "covariates = ['pain', 'urgency', 'frequency']\n",
+    "covariates = [\"pain\", \"urgency\", \"frequency\"]\n",
     "\n",
     "# Compute the covariance matrix using both treated and control data.\n",
     "combined = pd.concat([treated_data, control_data])\n",
